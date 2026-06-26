@@ -1,25 +1,24 @@
 #pragma once
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <initializer_list>
 #include <iterator>
-#include <limits>
 #include <new>
 #include <stdexcept>
-#include <sys/types.h>
+#include <tuple>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace swiss {
 // feel free to adjust the params for best performance
 // naming convention: k stands for constant
-static constexpr size_t  kGroupSlots   = 8;
-static constexpr size_t  kMaxAvgGroupLoad = 7;
+static constexpr size_t kGroupSlots = 16;
+static constexpr size_t kMaxAvgGroupLoad = 14;
 // load factor = maxAvgGroupLoad / maxGroupSlots
-
 
 template <class Key, class T, class Hash = std::hash<Key>,
           class KeyEqual = std::equal_to<Key>
@@ -46,11 +45,12 @@ public:
         friend class SwissTable;
         SwissTable* table_ = nullptr;
         size_t index_ = 0;
+        size_t pos_ = 0;
 
     public:
         Iterator() = default;
-        Iterator(SwissTable* table, size_t index) noexcept
-            : table_(table), index_(index) {}
+        Iterator(SwissTable* table, size_t index, size_t pos) noexcept
+            : table_(table), index_(index), pos_(pos) {}
 
         // return the reference to the element the iterator points to
         kvpair_t& operator*() const noexcept {
@@ -64,12 +64,11 @@ public:
 
         // ++it. increment the iterator and return the iterator AFTER incrementing
         constexpr Iterator &operator++() noexcept {
-            if (table_ != nullptr && index_ < table_->capacity_) {
-                ++index_;
-                while (index_ < table_->capacity_
-                       && !table_->is_occupied(table_->ctrl_[index_])) {
-                    ++index_;
-                }
+            if (table_ != nullptr && pos_ < table_->order_.size()) {
+                ++pos_;
+                index_ = pos_ < table_->order_.size()
+                             ? table_->order_[pos_]
+                             : table_->capacity_;
             }
             return *this;
         }
@@ -95,14 +94,19 @@ private:
     static constexpr unsigned char kEmpty = 0xfe;
     static constexpr unsigned char kDeleted = 0x80;
     static constexpr unsigned char kH2Mask = 0x7f;
+    static constexpr std::uint64_t kMsbs = 0x8080808080808080ULL;
+    static constexpr std::uint64_t kLsbs = 0x0101010101010101ULL;
+    static constexpr size_t kNpos = static_cast<size_t>(-1);
 
     using storage_t = std::aligned_storage_t<sizeof(kvpair_t), alignof(kvpair_t)>;
 
     storage_t* slots_ = nullptr;
     unsigned char* ctrl_ = nullptr;
+    size_t* pos_of_ = nullptr;
     size_t capacity_ = 0;
     size_t size_ = 0;
     size_t deleted_ = 0;
+    std::vector<size_t> order_{};
     Hash hash_{};
     KeyEqual equal_{};
 
@@ -112,27 +116,32 @@ private:
 
     static constexpr size_t mix_hash(size_t hash) noexcept {
         if constexpr (sizeof(size_t) >= sizeof(std::uint64_t)) {
-            hash ^= hash >> 33U;
-            hash *= static_cast<size_t>(0xff51afd7ed558ccdULL);
-            hash ^= hash >> 33U;
-            hash *= static_cast<size_t>(0xc4ceb9fe1a85ec53ULL);
-            hash ^= hash >> 33U;
+            return hash * static_cast<size_t>(0x9e3779b97f4a7c15ULL);
         } else {
-            hash ^= hash >> 16U;
-            hash *= static_cast<size_t>(0x7feb352dU);
-            hash ^= hash >> 15U;
-            hash *= static_cast<size_t>(0x846ca68bU);
-            hash ^= hash >> 16U;
+            return hash * static_cast<size_t>(0x9e3779b9U);
         }
-        return hash;
     }
 
     static constexpr size_t h1(size_t hash) noexcept {
-        return hash >> 7U;
+        return hash;
     }
 
     static constexpr unsigned char h2(size_t hash) noexcept {
-        return static_cast<unsigned char>(hash & kH2Mask);
+        if constexpr (sizeof(size_t) >= sizeof(std::uint64_t)) {
+            return static_cast<unsigned char>((hash >> 57U) & kH2Mask);
+        } else {
+            return static_cast<unsigned char>((hash >> 25U) & kH2Mask);
+        }
+    }
+
+    static constexpr std::uint64_t repeat_byte(unsigned char byte) noexcept {
+        return kLsbs * static_cast<std::uint64_t>(byte);
+    }
+
+    static constexpr std::uint64_t match_byte_word(std::uint64_t word,
+                                                   unsigned char byte) noexcept {
+        const std::uint64_t x = word ^ repeat_byte(byte);
+        return (x - kLsbs) & ~x & kMsbs;
     }
 
     [[nodiscard]] kvpair_t* slot(size_t index) noexcept {
@@ -147,13 +156,25 @@ private:
         return capacity_ / kGroupSlots;
     }
 
+    [[nodiscard]] std::uint64_t ctrl_word(size_t index) const noexcept {
+        std::uint64_t word = 0;
+#if defined(__GNUC__) || defined(__clang__)
+        __builtin_memcpy(&word, ctrl_ + index, sizeof(word));
+#else
+        for (size_t i = 0; i < sizeof(word); ++i) {
+            word |= static_cast<std::uint64_t>(ctrl_[index + i]) << (i * 8U);
+        }
+#endif
+        return word;
+    }
+
     static size_t slots_for_count(size_t count) {
         size_t needed = (count * kGroupSlots + kMaxAvgGroupLoad - 1)
                         / kMaxAvgGroupLoad;
         needed = std::max(needed, kGroupSlots);
         size_t capacity = kGroupSlots;
         while (capacity < needed) {
-            capacity *= 2;
+            capacity <<= 1U;
         }
         return capacity;
     }
@@ -169,19 +190,20 @@ private:
         slots_ = static_cast<storage_t*>(
             ::operator new[](capacity * sizeof(storage_t),
                              std::align_val_t{alignof(storage_t)}));
-        ctrl_ = new unsigned char[capacity];
-        std::fill(ctrl_, ctrl_ + capacity, kEmpty);
+        ctrl_ = new unsigned char[capacity + kGroupSlots];
+        pos_of_ = new size_t[capacity];
+        std::fill(ctrl_, ctrl_ + capacity + kGroupSlots, kEmpty);
         capacity_ = capacity;
         size_ = 0;
         deleted_ = 0;
+        order_.clear();
     }
 
     void destroy_elements() noexcept {
-        for (size_t i = 0; i < capacity_; ++i) {
-            if (is_occupied(ctrl_[i])) {
-                slot(i)->~kvpair_t();
-            }
+        for (size_t index : order_) {
+            slot(index)->~kvpair_t();
         }
+        order_.clear();
         size_ = 0;
         deleted_ = 0;
     }
@@ -191,9 +213,11 @@ private:
             destroy_elements();
             ::operator delete[](slots_, std::align_val_t{alignof(storage_t)});
             delete[] ctrl_;
+            delete[] pos_of_;
         }
         slots_ = nullptr;
         ctrl_ = nullptr;
+        pos_of_ = nullptr;
         capacity_ = 0;
     }
 
@@ -202,79 +226,131 @@ private:
         bool found = false;
     };
 
-    LookupResult lookup(const Key& key) const {
+    LookupResult lookup_with_hash(const Key& key, size_t hash,
+                                  unsigned char tag) const {
         if (capacity_ == 0) {
             return {0, false};
         }
 
-        const size_t hash = mix_hash(hash_(key));
-        const unsigned char tag = h2(hash);
-        const size_t groups = group_count();
-        const size_t start = h1(hash) & (groups - 1);
+        const size_t mask = group_count() - 1;
+        size_t group = h1(hash) & mask;
 
-        for (size_t probe = 0; probe < groups; ++probe) {
-            const size_t group = (start + (probe * probe + probe) / 2) & (groups - 1);
+        for (size_t step = 1; step <= group_count(); ++step) {
             const size_t begin = group * kGroupSlots;
-            bool has_empty = false;
+            const std::uint64_t low = ctrl_word(begin);
+            const std::uint64_t high = ctrl_word(begin + 8);
+            std::uint64_t matches = match_byte_word(low, tag);
 
-            for (size_t offset = 0; offset < kGroupSlots; ++offset) {
+            while (matches != 0) {
+                const size_t offset = static_cast<size_t>(std::countr_zero(matches) >> 3U);
                 const size_t index = begin + offset;
-                const unsigned char ctrl = ctrl_[index];
-                if (ctrl == kEmpty) {
-                    has_empty = true;
-                } else if (ctrl == tag && equal_(slot(index)->first, key)) {
+                if (equal_(slot(index)->first, key)) {
                     return {index, true};
                 }
+                matches &= matches - 1U;
             }
 
-            if (has_empty) {
+            matches = match_byte_word(high, tag);
+            while (matches != 0) {
+                const size_t offset = 8U + static_cast<size_t>(std::countr_zero(matches) >> 3U);
+                const size_t index = begin + offset;
+                if (equal_(slot(index)->first, key)) {
+                    return {index, true};
+                }
+                matches &= matches - 1U;
+            }
+
+            if (match_byte_word(low, kEmpty) != 0
+                || match_byte_word(high, kEmpty) != 0) {
                 return {0, false};
             }
+            group = (group + step) & mask;
         }
         return {0, false};
     }
 
-    LookupResult find_insert_position(const Key& key) {
-        const size_t hash = mix_hash(hash_(key));
-        const unsigned char tag = h2(hash);
-        const size_t groups = group_count();
-        const size_t start = h1(hash) & (groups - 1);
+    LookupResult lookup(const Key& key) const {
+        const size_t hash = hash_(key);
+        return lookup_with_hash(key, hash, h2(mix_hash(hash)));
+    }
+
+    LookupResult find_insert_position(const Key& key, size_t hash,
+                                      unsigned char tag) {
+        const size_t mask = group_count() - 1;
+        size_t group = h1(hash) & mask;
         size_t first_available = capacity_;
 
-        for (size_t probe = 0; probe < groups; ++probe) {
-            const size_t group = (start + (probe * probe + probe) / 2) & (groups - 1);
+        for (size_t step = 1; step <= group_count(); ++step) {
             const size_t begin = group * kGroupSlots;
+            const std::uint64_t low = ctrl_word(begin);
+            const std::uint64_t high = ctrl_word(begin + 8);
+            std::uint64_t matches = match_byte_word(low, tag);
 
-            for (size_t offset = 0; offset < kGroupSlots; ++offset) {
+            while (matches != 0) {
+                const size_t offset = static_cast<size_t>(std::countr_zero(matches) >> 3U);
                 const size_t index = begin + offset;
-                const unsigned char ctrl = ctrl_[index];
-                if (ctrl == tag && equal_(slot(index)->first, key)) {
+                if (equal_(slot(index)->first, key)) {
                     return {index, true};
                 }
-                if ((ctrl == kDeleted || ctrl == kEmpty)
-                    && first_available == capacity_) {
-                    first_available = index;
-                }
+                matches &= matches - 1U;
             }
 
-            for (size_t offset = 0; offset < kGroupSlots; ++offset) {
-                if (ctrl_[begin + offset] == kEmpty) {
+            matches = match_byte_word(high, tag);
+            while (matches != 0) {
+                const size_t offset = 8U + static_cast<size_t>(std::countr_zero(matches) >> 3U);
+                const size_t index = begin + offset;
+                if (equal_(slot(index)->first, key)) {
+                    return {index, true};
+                }
+                matches &= matches - 1U;
+            }
+
+            std::uint64_t available = low & kMsbs;
+            if (available != 0) {
+                if (first_available == capacity_) {
+                    const size_t offset = static_cast<size_t>(std::countr_zero(available) >> 3U);
+                    first_available = begin + offset;
+                }
+                if (match_byte_word(low, kEmpty) != 0) {
                     return {first_available, false};
                 }
             }
+
+            available = high & kMsbs;
+            if (available != 0) {
+                if (first_available == capacity_) {
+                    const size_t offset = 8U + static_cast<size_t>(std::countr_zero(available) >> 3U);
+                    first_available = begin + offset;
+                }
+                if (match_byte_word(high, kEmpty) != 0) {
+                    return {first_available, false};
+                }
+            }
+            group = (group + step) & mask;
         }
         return {first_available, false};
     }
 
+    void add_order(size_t index) {
+        pos_of_[index] = order_.size();
+        order_.push_back(index);
+    }
+
+    Iterator iterator_at(size_t index) noexcept {
+        return Iterator(this, index, pos_of_[index]);
+    }
+
     template <class Pair>
     std::pair<Iterator, bool> insert_impl(Pair&& value) {
+        const size_t hash = hash_(value.first);
+        const unsigned char tag = h2(mix_hash(hash));
         if (should_grow(size_ + 1)) {
             reserve(size_ + 1);
         }
 
-        LookupResult result = find_insert_position(value.first);
+        LookupResult result = find_insert_position(value.first, hash, tag);
         if (result.found) {
-            return {Iterator(this, result.index), false};
+            return {iterator_at(result.index), false};
         }
 
         const size_t index = result.index;
@@ -282,9 +358,20 @@ private:
             --deleted_;
         }
         new (&slots_[index]) kvpair_t(std::forward<Pair>(value));
-        ctrl_[index] = h2(mix_hash(hash_(slot(index)->first)));
+        ctrl_[index] = tag;
         ++size_;
-        return {Iterator(this, index), true};
+        add_order(index);
+        return {iterator_at(index), true};
+    }
+
+    void unchecked_insert_move(kvpair_t&& value) {
+        const size_t hash = hash_(value.first);
+        const unsigned char tag = h2(mix_hash(hash));
+        const size_t index = find_insert_position(value.first, hash, tag).index;
+        new (&slots_[index]) kvpair_t(std::move(value));
+        ctrl_[index] = tag;
+        ++size_;
+        add_order(index);
     }
 
     void rehash_to(size_t new_capacity) {
@@ -292,11 +379,10 @@ private:
         tmp.hash_ = hash_;
         tmp.equal_ = equal_;
         tmp.allocate_arrays(new_capacity);
+        tmp.order_.reserve(size_);
 
-        for (size_t i = 0; i < capacity_; ++i) {
-            if (is_occupied(ctrl_[i])) {
-                tmp.insert(std::move(*slot(i)));
-            }
+        for (size_t index : order_) {
+            tmp.unchecked_insert_move(std::move(*slot(index)));
         }
         swap(tmp);
     }
@@ -328,16 +414,12 @@ public:
     // iterator interfaces
     // return begin iterator
     Iterator begin() noexcept {
-        size_t index = 0;
-        while (index < capacity_ && !is_occupied(ctrl_[index])) {
-            ++index;
-        }
-        return Iterator(this, index);
+        return order_.empty() ? end() : Iterator(this, order_[0], 0);
     }
 
     // return end iterator (the iterator AFTER the last element)
     Iterator end() noexcept {
-        return Iterator(this, capacity_);
+        return Iterator(this, capacity_, order_.size());
     }
 
     // common STL interface
@@ -346,7 +428,7 @@ public:
     void clear() noexcept {
         destroy_elements();
         if (ctrl_ != nullptr) {
-            std::fill(ctrl_, ctrl_ + capacity_, kEmpty);
+            std::fill(ctrl_, ctrl_ + capacity_ + kGroupSlots, kEmpty);
         }
     }
 
@@ -378,9 +460,28 @@ public:
     // a default implementation is provided
     // insert a value by the key AND arguments passed to its constructor
     template <class K, class... Args> std::pair<Iterator, bool> try_emplace(K&& key, Args &&...args) {
-        // this function can be implemented differently
-        // you are encouraged to explore a better implementation that has more cpp flavor
-        return insert(kvpair_t(std::forward<K>(key), T(std::forward<Args>(args)...)));
+        const size_t hash = hash_(key);
+        const unsigned char tag = h2(mix_hash(hash));
+        if (should_grow(size_ + 1)) {
+            reserve(size_ + 1);
+        }
+
+        LookupResult result = find_insert_position(key, hash, tag);
+        if (result.found) {
+            return {iterator_at(result.index), false};
+        }
+
+        const size_t index = result.index;
+        if (ctrl_[index] == kDeleted) {
+            --deleted_;
+        }
+        new (&slots_[index]) kvpair_t(std::piecewise_construct,
+                                      std::forward_as_tuple(std::forward<K>(key)),
+                                      std::forward_as_tuple(std::forward<Args>(args)...));
+        ctrl_[index] = tag;
+        ++size_;
+        add_order(index);
+        return {iterator_at(index), true};
     }
 
     // erase a value by its iterator
@@ -392,14 +493,10 @@ public:
         }
 
         const size_t index = posIt.index_;
+        const size_t pos = pos_of_[index];
         const size_t group_begin = (index / kGroupSlots) * kGroupSlots;
-        bool group_has_empty = false;
-        for (size_t offset = 0; offset < kGroupSlots; ++offset) {
-            if (ctrl_[group_begin + offset] == kEmpty) {
-                group_has_empty = true;
-                break;
-            }
-        }
+        const bool group_has_empty = match_byte_word(ctrl_word(group_begin), kEmpty) != 0
+                                     || match_byte_word(ctrl_word(group_begin + 8), kEmpty) != 0;
 
         slot(index)->~kvpair_t();
         ctrl_[index] = group_has_empty ? kEmpty : kDeleted;
@@ -408,14 +505,20 @@ public:
         }
         --size_;
 
-        Iterator next(this, index);
-        ++next;
-        return next;
+        const size_t last_index = order_.back();
+        order_[pos] = last_index;
+        pos_of_[last_index] = pos;
+        order_.pop_back();
+        pos_of_[index] = kNpos;
+
+        if (pos < order_.size()) {
+            return Iterator(this, order_[pos], pos);
+        }
+        return end();
     }
 
     // erase a value by its key
     size_t erase(const Key &key) {
-        // you can implement your own logic
         auto it = find(key);
         if (it == end())
             return 0;
@@ -459,15 +562,15 @@ public:
     // otherwise, return end()
     Iterator find(const Key &key) {
         auto result = lookup(key);
-        return result.found ? Iterator(this, result.index) : end();
+        return result.found ? iterator_at(result.index) : end();
     }
 
     // const version of the one above
     Iterator find(const Key &key) const {
         auto result = lookup(key);
         return result.found
-                   ? Iterator(const_cast<SwissTable*>(this), result.index)
-                   : Iterator(const_cast<SwissTable*>(this), capacity_);
+                   ? Iterator(const_cast<SwissTable*>(this), result.index, pos_of_[result.index])
+                   : Iterator(const_cast<SwissTable*>(this), capacity_, order_.size());
     }
 
     // return true if the key exists, false otherwise
@@ -481,7 +584,7 @@ public:
     // be slow if many elements are inserted without reserving space.
     void reserve(size_t count) {
         const size_t wanted = slots_for_count(count);
-        if (wanted > capacity_ || deleted_ > size_) {
+        if (wanted > capacity_ || (deleted_ > size_ && wanted >= slots_for_count(size_))) {
             rehash_to(std::max(wanted, slots_for_count(size_)));
         }
     }
@@ -533,10 +636,8 @@ public:
         hash_ = other.hash_;
         equal_ = other.equal_;
         reserve(other.size_);
-        for (size_t i = 0; i < other.capacity_; ++i) {
-            if (is_occupied(other.ctrl_[i])) {
-                insert(*other.slot(i));
-            }
+        for (size_t index : other.order_) {
+            insert(*other.slot(index));
         }
     }
 
@@ -557,7 +658,6 @@ public:
     // move assignment
     SwissTable& operator=(SwissTable&& other) {
         if (this != &other) {
-            clear();
             free_arrays();
             swap(other);
         }
@@ -578,9 +678,11 @@ public:
         using std::swap;
         swap(slots_, other.slots_);
         swap(ctrl_, other.ctrl_);
+        swap(pos_of_, other.pos_of_);
         swap(capacity_, other.capacity_);
         swap(size_, other.size_);
         swap(deleted_, other.deleted_);
+        swap(order_, other.order_);
         swap(hash_, other.hash_);
         swap(equal_, other.equal_);
     }
