@@ -195,9 +195,11 @@ private:
 
     [[nodiscard]] bool should_grow(size_t wanted_size) const noexcept {
         return capacity_ == 0
-               || wanted_size * kGroupSlots > capacity_ * kMaxAvgGroupLoad
-               || (wanted_size + deleted_) * kGroupSlots
-                      > capacity_ * kMaxAvgGroupLoad;
+               || wanted_size * kGroupSlots > capacity_ * kMaxAvgGroupLoad;
+    }
+
+    [[nodiscard]] bool should_cleanup_deleted() const noexcept {
+        return deleted_ > capacity_ / 4U && deleted_ > size_ * 2U;
     }
 
     void allocate_arrays(size_t capacity) {
@@ -292,6 +294,7 @@ private:
                                       unsigned char tag) {
         const size_t mask = group_count() - 1U;
         size_t group = h1(hash) & mask;
+        size_t first_deleted = capacity_;
         for (size_t step = 1; step <= group_count(); ++step) {
             const size_t begin = group * kGroupSlots;
             const std::uint64_t low = ctrl_word(begin);
@@ -317,38 +320,41 @@ private:
                 matches &= matches - 1U;
             }
 
-            std::uint64_t available = match_byte_word(low, kEmpty);
+            std::uint64_t available = match_byte_word(low, kDeleted);
+            if (available != 0 && first_deleted == capacity_) {
+                const size_t offset = static_cast<size_t>(std::countr_zero(available) >> 3U);
+                first_deleted = begin + offset;
+            }
+            available = match_byte_word(high, kDeleted);
+            if (available != 0 && first_deleted == capacity_) {
+                const size_t offset = 8U + static_cast<size_t>(std::countr_zero(available) >> 3U);
+                first_deleted = begin + offset;
+            }
+
+            available = match_byte_word(low, kEmpty);
             if (available != 0) {
+                if (first_deleted != capacity_) {
+                    return {first_deleted, false};
+                }
                 const size_t offset = static_cast<size_t>(std::countr_zero(available) >> 3U);
                 return {begin + offset, false};
             }
 
             available = match_byte_word(high, kEmpty);
             if (available != 0) {
+                if (first_deleted != capacity_) {
+                    return {first_deleted, false};
+                }
                 const size_t offset = 8U + static_cast<size_t>(std::countr_zero(available) >> 3U);
                 return {begin + offset, false};
             }
             group = (group + step) & mask;
         }
-        return {capacity_, false};
+        return {first_deleted, false};
     }
 
     void add_order(size_t index) {
         order_.push_back(static_cast<std::uint32_t>(index));
-    }
-
-    void compact_order_if_needed() {
-        if (order_.size() <= size_ * 2U + 64U) {
-            return;
-        }
-        std::vector<std::uint32_t> compact;
-        compact.reserve(size_);
-        for (std::uint32_t raw_index : order_) {
-            if (is_live_index(raw_index)) {
-                compact.push_back(raw_index);
-            }
-        }
-        order_.swap(compact);
     }
 
     [[nodiscard]] size_t next_live_slot(size_t start) const noexcept {
@@ -380,13 +386,16 @@ private:
         }
 
         const size_t index = result.index;
-        if (ctrl_[index] == kDeleted) {
+        const bool reused_deleted = ctrl_[index] == kDeleted;
+        if (reused_deleted) {
             --deleted_;
         }
         new (&slots_[index]) kvpair_t(std::forward<Pair>(value));
         ctrl_[index] = tag;
         ++size_;
-        add_order(index);
+        if (!reused_deleted) {
+            add_order(index);
+        }
         return {iterator_at(index), true};
     }
 
@@ -421,6 +430,18 @@ private:
         swap(tmp);
     }
 
+    void erase_index_no_return(size_t index) {
+        slot(index)->~kvpair_t();
+        ctrl_[index] = kDeleted;
+        ++deleted_;
+        --size_;
+        if (size_ == 0) {
+            clear();
+        } else if (should_cleanup_deleted()) {
+            rehash_to(slots_for_count(size_));
+        }
+    }
+
     Iterator erase_index(size_t index, size_t pos_hint) {
         const size_t group_begin = (index / kGroupSlots) * kGroupSlots;
         (void)group_begin;
@@ -446,7 +467,10 @@ private:
         } else {
             next = Iterator(this, next_live_slot(index + 1U), kNpos);
         }
-        compact_order_if_needed();
+        if (size_ == 0) {
+            clear();
+            return end();
+        }
         return next;
     }
 
@@ -547,7 +571,8 @@ public:
         }
 
         const size_t index = result.index;
-        if (ctrl_[index] == kDeleted) {
+        const bool reused_deleted = ctrl_[index] == kDeleted;
+        if (reused_deleted) {
             --deleted_;
         }
         new (&slots_[index]) kvpair_t(std::piecewise_construct,
@@ -555,7 +580,9 @@ public:
                                       std::forward_as_tuple(std::forward<Args>(args)...));
         ctrl_[index] = tag;
         ++size_;
-        add_order(index);
+        if (!reused_deleted) {
+            add_order(index);
+        }
         return {iterator_at(index), true};
     }
 
@@ -575,7 +602,7 @@ public:
         if (!result.found) {
             return 0;
         }
-        (void)erase_index(result.index, kNpos);
+        erase_index_no_return(result.index);
         return 1;
     }
 
